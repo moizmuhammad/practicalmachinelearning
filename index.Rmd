@@ -4,19 +4,216 @@ author: "Moiz "
 date: "01/21/2017"
 output: html_document 
 ---
+###Project Overview
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>. ()
+The objective of this project is to build a classification model based on the data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants who were asked to perform barbell lifts correctly and incorrectly in 5 different ways. The correct/incorrect ways have been assigned the following classes:
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+    Class A. Exactly according to the specification (correct way) 
+    Class B. Throwing the elbows to the front (incorrect way) 
+    Class C. Lifting the dumbbell only halfway (incorrect way) 
+    Class D. Lowering the dumbbell only halfway (incorrect way) 
+    Class E. Throwing the hips to the front (incorrect way)
 
-```{r}
-summary(cars)
+
+###Dataset Preprocessing
+
+The given dataset includes 19,622 observations of 160 variables. Out of 19,622 observations, only 406 observations are complete
+
+```{r,eval=TRUE,echo=TRUE}
+#load the library
+library(caret)
+
+#set seed
+set.seed(123)
+
+#load data
+data = read.csv('/home/moiz/education/PracticalMachineLearning/pml-training.csv')
+
+#total complete cases
+ccases =  round( ( sum(complete.cases(data)==TRUE) / dim(data)[1] ) * 100 )
+print( paste('Percentage of complete observations =', ccases, '%' ))
 ```
 
-You can also embed plots, for example:
+Exploration of the dataset resulted in the following actions:
 
-```{r, echo=FALSE}
-plot(cars)
+1. Out of 160 variables, first 7 variables needs to be excluded as they only describes the observation i.e. meta information about the observation.  
+
+2. Last variable holds the classification (classe) 
+
+3. Convert all factors to numeric for predictors
+
+4. Remove predictors having near zero variance
+
+R code for above pre-processing is
+
+```{r,eval=TRUE,echo=TRUE}
+#get names  of variables
+variables = names(data[,-(1:7)])
+data = data[,variables]
+
+#find the index of last variable (used for classification)
+classVariableIndex = length(variables)
+
+#define list of predictors by excluding the class variable (classe)
+predictors = variables[-classVariableIndex]
+
+#convert all the factors predictors to numeric 
+for(i in 1:length(predictors)) {
+  if(class(data[,i]) == 'factor') {
+    data[,i] = as.numeric(data[,i])
+  }
+}
+
+#remove predictors having zero variance
+nzvVariables = nearZeroVar(data[, predictors], saveMetrics = FALSE)
+predictors = predictors[-nzvVariables]
+
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+With the above processing, predictors have reduced to `r length(predictors) `. Now will also to remove any correlated features 
+
+```{r,eval=TRUE,echo=TRUE}
+#function for excluding any correlated predictors
+excludeCorrelatedFeatures <- function(dataset, cutoff=0.5) {
+  corMatrix <- cor(dataset)
+  highlyCorrelated <- findCorrelation(x=corMatrix, cutoff=cutoff)
+  return(dataset[,-highlyCorrelated])
+}
+
+#remove any NA (which is required for finding correlation)
+d1 = na.omit(data[,predictors])
+
+#exclude correlated features (>=0.6) to identify final predictors
+d2 = excludeCorrelatedFeatures(d1[,predictors], cutoff=0.6)
+predictors = names(d2)
+
+#total complete cases
+ccases =  round( ( sum(complete.cases(data[,predictors])==TRUE) / dim(data)[1] ) * 100 )
+print( paste('Percentage of complete observations =', ccases, '%' ))
+```
+
+Now with all the above preprocesing, the final list of predictors is:
+
+```{r,eval=TRUE,echo=FALSE}
+print(predictors)
+```
+
+
+###Classification Model Building
+
+As noted above, only `r ccases`% observations are complete. With so much sparsity, we have at least 2 options for model selection:
+
+  1. Impute the missing values before building model.
+  2. Limit to only those models that can deal with missing values.
+
+We will limit ourself to second option and will try to evaluate the model performance on decision trees (C5.0). Additionaly we will be using *caret* package for model training and tuning. 
+
+But before we jump into model building, we will first split the given dataset into training, validation and test subsets.
+
+####Prepare Training, Validation and Test Datasets
+
+The proportion of split is as follows::
+
+  1. 60% Training dataset 
+  2. 20% Validation dataset
+  3. 20% Test dataset
+
+In order to quickly evaluate candidate models, we took 10% of training data (named as explorationData) and build the models on them.
+
+```{r,eval=TRUE,echo=TRUE}
+
+#prepare training data
+inTrain = createDataPartition(data$classe, p=0.6, list=FALSE)
+trainData = data[inTrain,predictors]
+trainClass = data[inTrain,classVariableIndex]
+
+#prepare exploration data (10% of training data)
+inExploration = createDataPartition(trainClass, p= 0.1, list=FALSE)
+explorationData = data[inExploration,predictors]
+explorationClass = data[inExploration,classVariableIndex]
+
+#prepare test data (20% )
+remainData = data[-inTrain,]
+inTest = createDataPartition(remainData$classe, p=0.5, list=FALSE)
+testData = remainData[inTest,predictors]
+testData$classe = remainData[inTest,classVariableIndex]
+
+#prepare validation data (20%)
+validationData = remainData[-inTest,predictors]
+validationData$classe = remainData[-inTest,classVariableIndex]
+
+```
+
+####Model Selection
+
+Using 10-fold cross validation, we will first build the decision tree model.
+
+```{r,eval=TRUE,echo=TRUE}
+#a helper function for evaluating the model performance on test data
+evaluateModel <- function(model,testData, dataClass) {
+  p = predict(model, testData)
+  t = table(p, dataClass)
+  a = round( ( sum(diag(t)) / dim(testData)[1] ) * 100, 1 )
+  print( paste(model$method,'accuracy on given data is',a, '%'))
+  return(a)
+}
+
+##---C5.0 with 10-fold cross validation with simple solution
+c5Ctrl = trainControl(method='cv', number=10, selectionFunction='oneSE')
+c5Model = train(x=explorationData,y=explorationClass, method='C5.0', na.action=na.pass, trControl = c5Ctrl, metric="Kappa")
+accuracy = evaluateModel(c5Model, validationData, validationData$classe)
+```
+
+Now in order to tune the above model parameters, we will first print the model 
+
+```{r,eval=TRUE,echo=FALSE}
+print(c5Model)
+```
+
+The final model suggest the following parameters:
+
+  a. Model = 'rules'
+  b. Trials = 20
+  c. Winnow = TRUE
+
+By keeping model fixed to 'rules' and winnow fixed to TRUE, we will rebuid the model with different combination of trails:
+
+```{r,eval=TRUE,echo=TRUE}
+##---C5.0 with 10-fold cross validation with different trials and winnow
+c5Grid = expand.grid(.model='rules', .trials=c(1,5,10,15,20,25,30), .winnow=c('TRUE'))
+c5Model = train(x=explorationData,y=explorationClass, method='C5.0', na.action=na.pass, trControl = c5Ctrl, metric="Kappa", tuneGrid=c5Grid)
+accuracy = evaluateModel(c5Model, validationData, validationData$classe)
+
+```
+
+Similarly taking the print of the model shows trail of 15 gives us the optimum model:
+
+```{r,eval=TRUE,echo=FALSE}
+print(c5Model)
+```
+
+Now that we have found the values of model parameters, we will re-train the final model on training data and evaluate its performance first on validation data
+
+```{r,eval=TRUE,echo=TRUE}
+##---C5.0 with 10-fold cross validation with final
+c5Grid = expand.grid(.model='rules', .trials=c(15), .winnow=c('TRUE'))
+c5Model = train(x=trainData,y=trainClass, method='C5.0', na.action=na.pass, trControl = c5Ctrl, metric="Kappa", tuneGrid=c5Grid)
+accuracy = evaluateModel(c5Model, validationData, validationData$classe)
+
+```
+
+The resulting model seems to have good performance and therefore we are selecting this model as our final model.
+
+###Out of Sample Error
+
+To calculate the out of sample error, we will present the test dataset to our final model.
+
+```{r,eval=TRUE,echo=TRUE}
+accuracy = evaluateModel(c5Model, testData, testData$classe)
+```
+
+Hence the out of sample error rate is *`r 100-accuracy` %*.
+
+###Conclusion
+
+With so much missing values, the decision tree seems to have performed quite nicely. Out of sample error rate of `r 100-accuracy` % have proved the model viability.  
